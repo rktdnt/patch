@@ -1,0 +1,302 @@
+From ebe03beb336e8f75a2213d032df58693a3c073d2 Mon Sep 17 00:00:00 2001
+From: Andrei Vagin <avagin@openvz.org>
+Date: Tue, 10 Apr 2018 16:31:26 -0700
+Subject: [PATCH] proc: replace seq_printf by seq_put_smth to speed up
+ /proc/pid/status
+
+seq_printf() works slower than seq_puts, seq_puts, etc.
+
+== test_proc.c
+int main(int argc, char **argv)
+{
+	int n, i, fd;
+	char buf[16384];
+
+	n = atoi(argv[1]);
+	for (i = 0; i < n; i++) {
+		fd = open(argv[2], O_RDONLY);
+		if (fd < 0)
+			return 1;
+		if (read(fd, buf, sizeof(buf)) <= 0)
+			return 1;
+		close(fd);
+	}
+
+	return 0;
+}
+==
+
+$ time ./test_proc  1000000 /proc/1/status
+
+== Before path ==
+real	0m5.171s
+user	0m0.328s
+sys	0m4.783s
+
+== After patch ==
+real	0m4.761s
+user	0m0.334s
+sys	0m4.366s
+
+Link: http://lkml.kernel.org/r/20180212074931.7227-4-avagin@openvz.org
+Signed-off-by: Andrei Vagin <avagin@openvz.org>
+Cc: Alexey Dobriyan <adobriyan@gmail.com>
+Cc: KAMEZAWA Hiroyuki <kamezawa.hiroyu@jp.fujitsu.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Danny Lin <danny@kdrag0n.dev>
+Signed-off-by: Yaroslav Furman <yaro330@gmail.com>
+---
+ fs/proc/array.c | 13 +++++++++----
+ 1 file changed, 9 insertions(+), 4 deletions(-)
+
+diff --git a/fs/proc/array.c b/fs/proc/array.c
+index e596222b20fc..3485b5803210 100644
+--- a/fs/proc/array.c
++++ b/fs/proc/array.c
+@@ -188,7 +188,8 @@
+ 	task_unlock(p);
+ 	rcu_read_unlock();
+ 
+-	seq_printf(m, "State:\t%s", get_task_state(p));
++	seq_puts(m, "State:\t");
++	seq_puts(m, get_task_state(p));
+ 
+ 	seq_put_decimal_ull(m, "\nTgid:\t", tgid);
+ 	seq_put_decimal_ull(m, "\nNgid:\t", ngid);
+@@ -314,8 +315,8 @@
+ 
+ 	seq_puts(m, header);
+ 	CAP_FOR_EACH_U32(__capi) {
+-		seq_printf(m, "%08x",
+-			   a->cap[CAP_LAST_U32 - __capi]);
++		seq_put_hex_ll(m, NULL,
++			   a->cap[CAP_LAST_U32 - __capi], 8);
+ 	}
+ 	seq_putc(m, '\n');
+ }
+@@ -523,7 +524,11 @@
+ 	/* convert nsec -> ticks */
+ 	start_time = nsec_to_clock_t(task->real_start_time);
+ 
+-	seq_printf(m, "%d (%s) %c", pid_nr_ns(pid, ns), tcomm, state);
++	seq_put_decimal_ull(m, "", pid_nr_ns(pid, ns));
++	seq_puts(m, " (");
++	seq_puts(m, tcomm);
++	seq_puts(m, ") ");
++	seq_putc(m, state);
+ 	seq_put_decimal_ll(m, " ", ppid);
+ 	seq_put_decimal_ll(m, " ", pgid);
+ 	seq_put_decimal_ll(m, " ", sid);
+
+From 43abeb614a6c323d62b8eba68f571ab042bab28d Mon Sep 17 00:00:00 2001
+From: Andrei Vagin <avagin@openvz.org>
+Date: Tue, 10 Apr 2018 16:31:19 -0700
+Subject: [PATCH] proc: replace seq_printf on seq_putc to speed up
+ /proc/pid/smaps
+
+seq_putc() works much faster than seq_printf()
+
+== Before patch ==
+  $ time python test_smaps.py
+  real    0m3.828s
+  user    0m0.413s
+  sys     0m3.408s
+
+== After patch ==
+  $ time python test_smaps.py
+  real	0m3.405s
+  user	0m0.401s
+  sys	0m3.003s
+
+== Before patch ==
+-   75.51%     4.62%  python   [kernel.kallsyms]    [k] show_smap.isra.33
+   - 70.88% show_smap.isra.33
+      + 24.82% seq_put_decimal_ull_aligned
+      + 19.78% __walk_page_range
+      + 12.74% seq_printf
+      + 11.08% show_map_vma.isra.23
+      + 1.68% seq_puts
+
+== After patch ==
+-   69.16%     5.70%  python   [kernel.kallsyms]    [k] show_smap.isra.33
+   - 63.46% show_smap.isra.33
+      + 25.98% seq_put_decimal_ull_aligned
+      + 20.90% __walk_page_range
+      + 12.60% show_map_vma.isra.23
+        1.56% seq_putc
+      + 1.55% seq_puts
+
+Link: http://lkml.kernel.org/r/20180212074931.7227-2-avagin@openvz.org
+Signed-off-by: Andrei Vagin <avagin@openvz.org>
+Reviewed-by: Alexey Dobriyan <adobriyan@gmail.com>
+Cc: KAMEZAWA Hiroyuki <kamezawa.hiroyu@jp.fujitsu.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Danny Lin <danny@kdrag0n.dev>
+Signed-off-by: Yaroslav Furman <yaro330@gmail.com>
+---
+ fs/proc/task_mmu.c | 5 +++--
+ 1 file changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/fs/proc/task_mmu.c b/fs/proc/task_mmu.c
+index 61ba631748f3..ac62b32407d4 100644
+--- a/fs/proc/task_mmu.c
++++ b/fs/proc/task_mmu.c
+@@ -1092,8 +1092,9 @@ static void show_smap_vma_flags(struct seq_file *m, struct vm_area_struct *vma)
+ 		if (!mnemonics[i][0])
+ 			continue;
+ 		if (vma->vm_flags & (1UL << i)) {
+-			seq_printf(m, "%c%c ",
+-				   mnemonics[i][0], mnemonics[i][1]);
++			seq_putc(m, mnemonics[i][0]);
++			seq_putc(m, mnemonics[i][1]);
++			seq_putc(m, ' ');
+ 		}
+ 	}
+ 	seq_putc(m, '\n');
+From 7e33f383bc3ada48b0856883de48865c2a7e4e3c Mon Sep 17 00:00:00 2001
+From: Andrei Vagin <avagin@openvz.org>
+Date: Tue, 10 Apr 2018 16:30:44 -0700
+Subject: [PATCH] procfs: add seq_put_hex_ll to speed up /proc/pid/maps
+
+seq_put_hex_ll() prints a number in hexadecimal notation and works
+faster than seq_printf().
+
+== test.py
+  num = 0
+  with open("/proc/1/maps") as f:
+          while num < 10000 :
+                  data = f.read()
+                  f.seek(0, 0)
+                 num = num + 1
+==
+
+== Before patch ==
+  $  time python test.py
+
+  real	0m1.561s
+  user	0m0.257s
+  sys	0m1.302s
+
+== After patch ==
+  $ time python test.py
+
+  real	0m0.986s
+  user	0m0.279s
+  sys	0m0.707s
+
+$ perf -g record python test.py:
+
+== Before patch ==
+-   67.42%     2.82%  python   [kernel.kallsyms] [k] show_map_vma.isra.22
+   - 64.60% show_map_vma.isra.22
+      - 44.98% seq_printf
+         - seq_vprintf
+            - vsnprintf
+               + 14.85% number
+               + 12.22% format_decode
+                 5.56% memcpy_erms
+      + 15.06% seq_path
+      + 4.42% seq_pad
+   + 2.45% __GI___libc_read
+
+== After patch ==
+-   47.35%     3.38%  python   [kernel.kallsyms] [k] show_map_vma.isra.23
+   - 43.97% show_map_vma.isra.23
+      + 20.84% seq_path
+      - 15.73% show_vma_header_prefix
+           10.55% seq_put_hex_ll
+         + 2.65% seq_put_decimal_ull
+           0.95% seq_putc
+      + 6.96% seq_pad
+   + 2.94% __GI___libc_read
+
+[avagin@openvz.org: use unsigned int instead of int where it is suitable]
+  Link: http://lkml.kernel.org/r/20180214025619.4005-1-avagin@openvz.org
+[avagin@openvz.org: v2]
+  Link: http://lkml.kernel.org/r/20180117082050.25406-1-avagin@openvz.org
+Link: http://lkml.kernel.org/r/20180112185812.7710-1-avagin@openvz.org
+Signed-off-by: Andrei Vagin <avagin@openvz.org>
+Cc: Alexey Dobriyan <adobriyan@gmail.com>
+Cc: KAMEZAWA Hiroyuki <kamezawa.hiroyu@jp.fujitsu.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Danny Lin <danny@kdrag0n.dev>
+Signed-off-by: Yaroslav Furman <yaro330@gmail.com>
+---
+ fs/seq_file.c            | 46 ++++++++++++++++++++++++++++++++++++++++
+ include/linux/seq_file.h |  3 +++
+ 2 files changed, 49 insertions(+)
+
+diff --git a/fs/seq_file.c b/fs/seq_file.c
+index 6e6d8e8acecb..724e61302a9e 100644
+--- a/fs/seq_file.c
++++ b/fs/seq_file.c
+@@ -718,6 +718,52 @@ void seq_put_decimal_ull(struct seq_file *m, const char *delimiter,
+ }
+ EXPORT_SYMBOL(seq_put_decimal_ull);
+ 
++/**
++ * seq_put_hex_ll - put a number in hexadecimal notation
++ * @m: seq_file identifying the buffer to which data should be written
++ * @delimiter: a string which is printed before the number
++ * @v: the number
++ * @width: a minimum field width
++ *
++ * seq_put_hex_ll(m, "", v, 8) is equal to seq_printf(m, "%08llx", v)
++ *
++ * This routine is very quick when you show lots of numbers.
++ * In usual cases, it will be better to use seq_printf(). It's easier to read.
++ */
++void seq_put_hex_ll(struct seq_file *m, const char *delimiter,
++				unsigned long long v, unsigned int width)
++{
++	unsigned int len;
++	int i;
++
++	if (delimiter && delimiter[0]) {
++		if (delimiter[1] == 0)
++			seq_putc(m, delimiter[0]);
++		else
++			seq_puts(m, delimiter);
++	}
++
++	/* If x is 0, the result of __builtin_clzll is undefined */
++	if (v == 0)
++		len = 1;
++	else
++		len = (sizeof(v) * 8 - __builtin_clzll(v) + 3) / 4;
++
++	if (len < width)
++		len = width;
++
++	if (m->count + len > m->size) {
++		seq_set_overflow(m);
++		return;
++	}
++
++	for (i = len - 1; i >= 0; i--) {
++		m->buf[m->count + i] = hex_asc[0xf & v];
++		v = v >> 4;
++	}
++	m->count += len;
++}
++
+ void seq_put_decimal_ll(struct seq_file *m, const char *delimiter, long long num)
+ {
+ 	int len;
+diff --git a/include/linux/seq_file.h b/include/linux/seq_file.h
+index 576a3ab321df..782526786715 100644
+--- a/include/linux/seq_file.h
++++ b/include/linux/seq_file.h
+@@ -121,6 +121,9 @@ void seq_puts(struct seq_file *m, const char *s);
+ void seq_put_decimal_ull(struct seq_file *m, const char *delimiter,
+ 			 unsigned long long num);
+ void seq_put_decimal_ll(struct seq_file *m, const char *delimiter, long long num);
++void seq_put_hex_ll(struct seq_file *m, const char *delimiter,
++		    unsigned long long v, unsigned int width);
++
+ void seq_escape(struct seq_file *m, const char *s, const char *esc);
+ 
+ void seq_hex_dump(struct seq_file *m, const char *prefix_str, int prefix_type,

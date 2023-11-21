@@ -1,0 +1,374 @@
+From 4fb4f1f3b27a3b25b643e26fcea47080e6047819 Mon Sep 17 00:00:00 2001
+From: Sultan Alsawaf <sultan@kerneltoast.com>
+Date: Tue, 6 Apr 2021 18:34:09 -0700
+Subject: [PATCH] mm: Micro-optimize PID map reads for arm64 while retaining
+ output format
+
+Android and various applications in Android need to read PID map data in
+order to work. Some processes can contain over 10,000 mappings, which
+results in lots of time wasted on simply generating strings. This wasted
+time adds up, especially in the case of Unity-based games, which utilize
+the Boehm garbage collector. A game's main process typically has well
+over 10,000 mappings due to the loaded textures, and the Boehm GC reads
+PID maps several times a second. This results in over 100,000 map
+entries being printed out per second, so micro-optimization here is
+important. Before this commit, show_vma_header_prefix() would typically
+take around 1000 ns to run on a Snapdragon 855; now it only takes about
+50 ns to run, which is a 20x improvement.
+
+The primary micro-optimizations here assume that there are no more than
+40 bits in the virtual address space, hence the CONFIG_ARM64_VA_BITS
+check. Arm64 uses a virtual address size of 39 bits, so this perfectly
+covers it.
+
+This also removes padding used to beautify PID map output to further
+speed up reads and reduce the amount of bytes printed, and optimizes the
+dentry path retrieval for file-backed mappings. Note, however, that the
+trailing space at the end of the line for non-file-backed mappings
+cannot be omitted, as it breaks some PID map parsers.
+
+This still retains insignificant leading zeros from printed hex values
+to maintain the current output format.
+
+Signed-off-by: Sultan Alsawaf <sultan@kerneltoast.com>
+---
+ fs/dcache.c            |  20 ++---
+ fs/proc/task_mmu.c     | 189 +++++++++++++++++++++++++++++++++--------
+ include/linux/dcache.h |   1 +
+ 3 files changed, 165 insertions(+), 45 deletions(-)
+
+diff --git a/fs/dcache.c b/fs/dcache.c
+index 7024457103c7..eb9afe4b490d 100644
+--- a/fs/dcache.c
++++ b/fs/dcache.c
+@@ -3102,12 +3102,7 @@ static int prepend_name(char **buffer, int *buflen, const struct qstr *name)
+ 		return -ENAMETOOLONG;
+ 	p = *buffer -= dlen + 1;
+ 	*p++ = '/';
+-	while (dlen--) {
+-		char c = *dname++;
+-		if (!c)
+-			break;
+-		*p++ = c;
+-	}
++	memcpy(p, dname, dlen);
+ 	return 0;
+ }
+ 
+@@ -3310,9 +3305,9 @@ static void get_fs_root_rcu(struct fs_struct *fs, struct path *root)
+  *
+  * "buflen" should be positive.
+  */
+-char *d_path(const struct path *path, char *buf, int buflen)
++char *d_path_outlen(const struct path *path, char *buf, int *buflen)
+ {
+-	char *res = buf + buflen;
++	char *res = buf + *buflen;
+ 	struct path root;
+ 	int error;
+ 
+@@ -3329,17 +3324,22 @@ char *d_path(const struct path *path, char *buf, int buflen)
+ 	 */
+ 	if (path->dentry->d_op && path->dentry->d_op->d_dname &&
+ 	    (!IS_ROOT(path->dentry) || path->dentry != path->mnt->mnt_root))
+-		return path->dentry->d_op->d_dname(path->dentry, buf, buflen);
++		return path->dentry->d_op->d_dname(path->dentry, buf, *buflen);
+ 
+ 	rcu_read_lock();
+ 	get_fs_root_rcu(current->fs, &root);
+-	error = path_with_deleted(path, &root, &res, &buflen);
++	error = path_with_deleted(path, &root, &res, buflen);
+ 	rcu_read_unlock();
+ 
+ 	if (error < 0)
+ 		res = ERR_PTR(error);
+ 	return res;
+ }
++
++char *d_path(const struct path *path, char *buf, int buflen)
++{
++	return d_path_outlen(path, buf, &buflen);
++}
+ EXPORT_SYMBOL(d_path);
+ 
+ /*
+diff --git a/fs/proc/task_mmu.c b/fs/proc/task_mmu.c
+index b1ee054c4514..f8845dd413fc 100644
+--- a/fs/proc/task_mmu.c
++++ b/fs/proc/task_mmu.c
+@@ -144,7 +144,7 @@
+ 	page_offset = (unsigned long)name - page_start_vaddr;
+ 	num_pages = DIV_ROUND_UP(page_offset + max_len, PAGE_SIZE);
+ 
+-	seq_puts(m, "[anon:");
++	seq_write(m, "[anon:", 6);
+ 
+ 	for (i = 0; i < num_pages; i++) {
+ 		int len;
+@@ -156,7 +156,7 @@
+ 		pages_pinned = get_user_pages_remote(current, mm,
+ 				page_start_vaddr, 1, 0, &page, NULL);
+ 		if (pages_pinned < 1) {
+-			seq_puts(m, "<fault>]");
++			seq_write(m, "<fault>]\n", 9);
+ 			return;
+ 		}
+ 
+@@ -176,7 +176,7 @@
+ 		page_start_vaddr += PAGE_SIZE;
+ 	}
+ 
+-	seq_putc(m, ']');
++	seq_write(m, "]\n", 2);
+ }
+ 
+ static void vma_stop(struct proc_maps_private *priv)
+@@ -330,21 +330,117 @@
+ 		vma->vm_end >= vma->vm_mm->start_stack;
+ }
+ 
+-static void show_vma_header_prefix(struct seq_file *m,
+-				   unsigned long start, unsigned long end,
+-				   vm_flags_t flags, unsigned long long pgoff,
+-				   dev_t dev, unsigned long ino)
+-{
+-	seq_setwidth(m, 25 + sizeof(void *) * 6 - 1);
+-	seq_printf(m, "%08lx-%08lx %c%c%c%c %08llx %02x:%02x %lu ",
+-		   start,
+-		   end,
+-		   flags & VM_READ ? 'r' : '-',
+-		   flags & VM_WRITE ? 'w' : '-',
+-		   flags & VM_EXEC ? 'x' : '-',
+-		   flags & VM_MAYSHARE ? 's' : 'p',
+-		   pgoff,
+-		   MAJOR(dev), MINOR(dev), ino);
++#define print_vma_hex10(out, val, clz_fn) \
++({									\
++	const typeof(val) __val = val;					\
++	char *const __out = out;					\
++	size_t __len;							\
++									\
++	if (__val) {							\
++		__len = (sizeof(__val) * 8 - clz_fn(__val) + 3) / 4;	\
++		switch (__len) {					\
++		case 10:						\
++			__out[9] = hex_asc[(__val >>  0) & 0xf];	\
++			__out[8] = hex_asc[(__val >>  4) & 0xf];	\
++			__out[7] = hex_asc[(__val >>  8) & 0xf];	\
++			__out[6] = hex_asc[(__val >> 12) & 0xf];	\
++			__out[5] = hex_asc[(__val >> 16) & 0xf];	\
++			__out[4] = hex_asc[(__val >> 20) & 0xf];	\
++			__out[3] = hex_asc[(__val >> 24) & 0xf];	\
++			__out[2] = hex_asc[(__val >> 28) & 0xf];	\
++			__out[1] = hex_asc[(__val >> 32) & 0xf];	\
++			__out[0] = hex_asc[(__val >> 36) & 0xf];	\
++			break;						\
++		case 9:							\
++			__out[8] = hex_asc[(__val >>  0) & 0xf];	\
++			__out[7] = hex_asc[(__val >>  4) & 0xf];	\
++			__out[6] = hex_asc[(__val >>  8) & 0xf];	\
++			__out[5] = hex_asc[(__val >> 12) & 0xf];	\
++			__out[4] = hex_asc[(__val >> 16) & 0xf];	\
++			__out[3] = hex_asc[(__val >> 20) & 0xf];	\
++			__out[2] = hex_asc[(__val >> 24) & 0xf];	\
++			__out[1] = hex_asc[(__val >> 28) & 0xf];	\
++			__out[0] = hex_asc[(__val >> 32) & 0xf];	\
++			break;						\
++		default:						\
++			__out[7] = hex_asc[(__val >>  0) & 0xf];	\
++			__out[6] = hex_asc[(__val >>  4) & 0xf];	\
++			__out[5] = hex_asc[(__val >>  8) & 0xf];	\
++			__out[4] = hex_asc[(__val >> 12) & 0xf];	\
++			__out[3] = hex_asc[(__val >> 16) & 0xf];	\
++			__out[2] = hex_asc[(__val >> 20) & 0xf];	\
++			__out[1] = hex_asc[(__val >> 24) & 0xf];	\
++			__out[0] = hex_asc[(__val >> 28) & 0xf];	\
++			__len = 8;					\
++			break;						\
++		}							\
++	} else {							\
++		*(u64 *)__out = U64_C(0x3030303030303030);		\
++		__len = 8;						\
++	}								\
++									\
++	__len;								\
++})
++
++#define print_vma_hex2(out, val) \
++({									\
++	const typeof(val) __val = val;					\
++	char *const __out = out;					\
++									\
++	__out[1] = hex_asc[(__val >>  0) & 0xf];			\
++	__out[0] = hex_asc[(__val >>  4) & 0xf];			\
++									\
++	2;								\
++})
++
++static int show_vma_header_prefix(struct seq_file *m, unsigned long start,
++				  unsigned long end, vm_flags_t flags,
++				  unsigned long long pgoff, dev_t dev,
++				  unsigned long ino)
++{
++	size_t len;
++	char *out;
++
++	/* Set the overflow status to get more memory if there's no space */
++	if (seq_get_buf(m, &out) < 65) {
++		seq_commit(m, -1);
++		return -ENOMEM;
++	}
++
++	/* Supports printing up to 40 bits per virtual address */
++	BUILD_BUG_ON(CONFIG_ARM64_VA_BITS > 40);
++
++	len = print_vma_hex10(out, start, __builtin_clzl);
++
++	out[len++] = '-';
++
++	len += print_vma_hex10(out + len, end, __builtin_clzl);
++
++	out[len++] = ' ';
++	out[len++] = "-r"[!!(flags & VM_READ)];
++	out[len++] = "-w"[!!(flags & VM_WRITE)];
++	out[len++] = "-x"[!!(flags & VM_EXEC)];
++	out[len++] = "ps"[!!(flags & VM_MAYSHARE)];
++	out[len++] = ' ';
++
++	len += print_vma_hex10(out + len, pgoff, __builtin_clzll);
++
++	out[len++] = ' ';
++
++	len += print_vma_hex2(out + len, MAJOR(dev));
++
++	out[len++] = ':';
++
++	len += print_vma_hex2(out + len, MINOR(dev));
++
++	out[len++] = ' ';
++
++	len += num_to_str(&out[len], 20, ino);
++
++	out[len++] = ' ';
++
++	m->count += len;
++	return 0;
+ }
+ 
+ static void
+@@ -370,16 +466,44 @@
+ 	/* We don't show the stack guard page in /proc/maps */
+ 	start = vma->vm_start;
+ 	end = vma->vm_end;
+-	show_vma_header_prefix(m, start, end, flags, pgoff, dev, ino);
++	if (show_vma_header_prefix(m, start, end, flags, pgoff, dev, ino))
++		return;
+ 
+ 	/*
+ 	 * Print the dentry name for named mappings, and a
+ 	 * special [heap] marker for the heap:
+ 	 */
+ 	if (file) {
+-		seq_pad(m, ' ');
+-		seq_file_path(m, file, "\n");
+-		goto done;
++		char *buf;
++		size_t size = seq_get_buf(m, &buf);
++
++		/*
++		 * This won't escape newline characters from the path. If a
++		 * program uses newlines in its paths then it can kick rocks.
++		 */
++		if (size > 1) {
++			const int inlen = size - 1;
++			int outlen = inlen;
++			char *p;
++
++			p = d_path_outlen(&file->f_path, buf, &outlen);
++			if (!IS_ERR(p)) {
++				size_t len;
++
++				if (outlen != inlen)
++					len = inlen - outlen - 1;
++				else
++					len = strlen(p);
++				memmove(buf, p, len);
++				buf[len] = '\n';
++				seq_commit(m, len + 1);
++				return;
++			}
++		}
++
++		/* Set the overflow status to get more memory */
++		seq_commit(m, -1);
++		return;
+ 	}
+ 
+ 	if (vma->vm_ops && vma->vm_ops->name) {
+@@ -391,19 +515,19 @@
+ 	name = arch_vma_name(vma);
+ 	if (!name) {
+ 		if (!mm) {
+-			name = "[vdso]";
+-			goto done;
++			seq_write(m, "[vdso]\n", 7);
++			return;
+ 		}
+ 
+ 		if (vma->vm_start <= mm->brk &&
+ 		    vma->vm_end >= mm->start_brk) {
+-			name = "[heap]";
+-			goto done;
++			seq_write(m, "[heap]\n", 7);
++			return;
+ 		}
+ 
+ 		if (is_stack(priv, vma)) {
+-			name = "[stack]";
+-			goto done;
++			seq_write(m, "[stack]\n", 8);
++			return;
+ 		}
+ 
+ 		if (vma_get_anon_name(vma)) {
+@@ -413,10 +537,8 @@
+ 	}
+ 
+ done:
+-	if (name) {
+-		seq_pad(m, ' ');
++	if (name)
+ 		seq_puts(m, name);
+-	}
+ 	seq_putc(m, '\n');
+ }
+ 
+@@ -857,7 +979,6 @@
+ 	} else if (last_vma) {
+ 		show_vma_header_prefix(
+ 			m, mss->first_vma_start, vma->vm_end, 0, 0, 0, 0);
+-		seq_pad(m, ' ');
+ 		seq_puts(m, "[rollup]\n");
+ 	} else {
+ 		ret = SEQ_SKIP;
+@@ -866,7 +987,6 @@
+ 	if (!rollup_mode && vma_get_anon_name(vma)) {
+ 		seq_puts(m, "Name:           ");
+ 		seq_print_vma_name(m, vma);
+-		seq_putc(m, '\n');
+ 	}
+ 
+ 	if (!rollup_mode)
+
+diff --git a/include/linux/dcache.h b/include/linux/dcache.h
+index 02b96b4dde99..3687584d220c 100644
+--- a/include/linux/dcache.h
++++ b/include/linux/dcache.h
+@@ -305,6 +305,7 @@ extern char *simple_dname(struct dentry *, char *, int);
+ extern char *__d_path(const struct path *, const struct path *, char *, int);
+ extern char *d_absolute_path(const struct path *, char *, int);
+ extern char *d_path(const struct path *, char *, int);
++extern char *d_path_outlen(const struct path *, char *, int *);
+ extern char *dentry_path_raw(struct dentry *, char *, int);
+ extern char *dentry_path(struct dentry *, char *, int);
+ 

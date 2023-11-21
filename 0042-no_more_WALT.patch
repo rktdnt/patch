@@ -1,0 +1,20 @@
+--- a/kernel/sched/fair.c	2023-11-20 16:15:01.453406000 +0800
++++ b/kernel/sched/fair.c	2023-11-20 16:33:31.150438095 +0800
+@@ -10586,7 +10586,7 @@
+ 				env.flags |= LBF_ALL_PINNED;
+ 				goto out_one_pinned;
+ 			}
+-
++#ifdef CONFIG_SCHED_WALT
+ 			/*
+ 			 * ->active_balance synchronizes accesses to
+ 			 * ->active_balance_work.  Once set, it's cleared
+@@ -10599,6 +10599,7 @@
+ 				active_balance = 1;
+ 				mark_reserved(this_cpu);
+ 			}
++#endif			
+ 			raw_spin_unlock_irqrestore(&busiest->lock, flags);
+ 
+ 			if (active_balance) {
+
